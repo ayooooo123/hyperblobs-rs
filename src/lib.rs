@@ -108,15 +108,16 @@ impl Blobs {
         }
         // One range fetches every block in parallel; the gets below then wait in order.
         let _range = opts.wait.then(|| {
+            let bag = opts.bag.clone().unwrap_or_default();
             self.core
-                .download(id.block_offset, Some(id.block_end()), false)
+                .download_with_bag(id.block_offset, Some(id.block_end()), false, bag)
         });
         if id.block_length == 1 {
             return self.core.get(id.block_offset, opts).await;
         }
         let mut out = BytesMut::with_capacity(id.byte_length as usize);
         for i in id.block_offset..id.block_end() {
-            match self.core.get(i, opts).await? {
+            match self.core.get(i, opts.clone()).await? {
                 Some(b) => out.extend_from_slice(&b),
                 None => return Ok(None),
             }
