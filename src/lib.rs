@@ -82,9 +82,17 @@ impl Blobs {
 
     /// Stores `data` split into `block_size` blocks.
     pub async fn put(&self, data: &[u8]) -> Result<BlobId, CoreError> {
-        let mut w = self.writer().await;
+        let w = self.writer().await;
+        let mut batch = Vec::with_capacity(APPEND_BATCH);
         for chunk in data.chunks(self.block_size) {
-            w.write(Bytes::copy_from_slice(chunk)).await?;
+            batch.push(chunk);
+            if batch.len() == APPEND_BATCH {
+                w.core.append(&batch).await?;
+                batch.clear();
+            }
+        }
+        if !batch.is_empty() {
+            w.core.append(&batch).await?;
         }
         w.finish().await
     }
@@ -243,6 +251,31 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(blobs.get(&a, wait).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn borrowed_uploads_keep_batches_contiguous() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blobs = Blobs::new(core(tmp.path()), 4);
+        let data = vec![42; 4 * (APPEND_BATCH + 1) + 1];
+        let (first, second) = tokio::join!(blobs.put(&data), blobs.put(&data));
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert_eq!(first.block_offset, 0);
+        assert_eq!(first.block_length, 18);
+        assert_eq!(second.block_offset, first.block_end());
+        assert_eq!(second.byte_offset, first.byte_length);
+        for id in [first, second] {
+            assert_eq!(id.byte_length, data.len() as u64);
+            assert_eq!(
+                blobs
+                    .get(&id, GetOptions::default())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                data
+            );
+        }
     }
 
     #[test]
