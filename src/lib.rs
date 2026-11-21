@@ -26,8 +26,18 @@ pub struct BlobId {
 
 impl BlobId {
     /// Block index one past the blob.
-    pub fn block_end(&self) -> u64 {
-        self.block_offset + self.block_length
+    pub fn block_end(&self) -> Option<u64> {
+        self.block_offset.checked_add(self.block_length)
+    }
+
+    /// Reject an id whose block or byte range overflows.
+    pub fn fits(&self, _core: &Core) -> Result<(), CoreError> {
+        self.block_end()
+            .ok_or_else(|| CoreError::BadArgument("blob block range overflows".into()))?;
+        self.byte_offset
+            .checked_add(self.byte_length)
+            .ok_or_else(|| CoreError::BadArgument("blob byte range overflows".into()))?;
+        Ok(())
     }
 }
 
@@ -111,20 +121,22 @@ impl Blobs {
 
     /// The whole blob; `None` if a block is missing and `opts.wait` is off.
     pub async fn get(&self, id: &BlobId, opts: GetOptions) -> Result<Option<Bytes>, CoreError> {
+        id.fits(&self.core)?;
         if id.block_length == 0 {
             return Ok(Some(Bytes::new()));
         }
+        let block_end = id.block_end().expect("validated blob id");
         // One range fetches every block in parallel; the gets below then wait in order.
         let _range = opts.wait.then(|| {
             let bag = opts.bag.clone().unwrap_or_default();
             self.core
-                .download_with_bag(id.block_offset, Some(id.block_end()), false, bag)
+                .download_with_bag(id.block_offset, Some(block_end), false, bag)
         });
         if id.block_length == 1 {
             return self.core.get(id.block_offset, opts).await;
         }
-        let mut out = BytesMut::with_capacity(id.byte_length as usize);
-        for i in id.block_offset..id.block_end() {
+        let mut out = BytesMut::new();
+        for i in id.block_offset..block_end {
             match self.core.get(i, opts.clone()).await? {
                 Some(b) => out.extend_from_slice(&b),
                 None => return Ok(None),
@@ -135,7 +147,10 @@ impl Blobs {
 
     /// Drops the blob's blocks from local storage.
     pub async fn clear(&self, id: &BlobId) -> Result<(), CoreError> {
-        self.core.clear(id.block_offset, id.block_end()).await
+        id.fits(&self.core)?;
+        self.core
+            .clear(id.block_offset, id.block_end().expect("validated blob id"))
+            .await
     }
 }
 
@@ -263,7 +278,7 @@ mod tests {
         let second = second.unwrap();
         assert_eq!(first.block_offset, 0);
         assert_eq!(first.block_length, 18);
-        assert_eq!(second.block_offset, first.block_end());
+        assert_eq!(second.block_offset, first.block_end().unwrap());
         assert_eq!(second.byte_offset, first.byte_length);
         for id in [first, second] {
             assert_eq!(id.byte_length, data.len() as u64);
@@ -292,5 +307,65 @@ mod tests {
             &[1, 0xfd, 0x2c, 0x01, 0xfe, 0x70, 0x11, 0x01, 0x00, 0][..]
         );
         assert_eq!(compact_encoding::decode::<BlobId>(enc).unwrap(), id);
+    }
+
+    #[tokio::test]
+    async fn rejects_overflowing_blob_ids_without_large_allocation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blobs = Blobs::new(core(tmp.path()), 4);
+        let huge = BlobId {
+            block_length: 2,
+            byte_length: 1 << 40,
+            ..Default::default()
+        };
+        assert_eq!(
+            blobs
+                .get(
+                    &huge,
+                    GetOptions {
+                        wait: false,
+                        ..Default::default()
+                    }
+                )
+                .await
+                .unwrap(),
+            None
+        );
+        let block_overflow = BlobId {
+            block_offset: u64::MAX,
+            block_length: 1,
+            ..Default::default()
+        };
+        assert!(matches!(
+            blobs.clear(&block_overflow).await,
+            Err(CoreError::BadArgument(_))
+        ));
+        let byte_overflow = BlobId {
+            byte_offset: u64::MAX,
+            byte_length: 1,
+            ..Default::default()
+        };
+        assert!(matches!(
+            blobs.get(&byte_overflow, GetOptions::default()).await,
+            Err(CoreError::BadArgument(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn encrypted_ids_use_plaintext_byte_sizes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let core = Core::open(
+            &store,
+            CoreOptions {
+                key_pair: Some(KeyPair::from_seed(&[3; 32])),
+                encryption_key: Some([4; 32]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let blobs = Blobs::new(core, 4);
+        let id = blobs.put(b"hello").await.unwrap();
+        assert_eq!((id.byte_offset, id.byte_length), (0, 5));
     }
 }

@@ -28,6 +28,10 @@ assert_eq!(blobs.get(&id, GetOptions::default()).await?.as_deref(), Some(&b"hell
 
 Not ported: block maps and dedup (`blockMap`, `dedup`), monitors, batches.
 
+## Deviations from npm
+
+- Untrusted blob ids must not overflow their block or byte ranges.
+
 `cargo test --release --test allocations -- --ignored --nocapture` measures an
 isolated 64 MiB + 1 byte upload (1,025 blocks) and checks the stored bytes. The
 allocation assertion rejects a second full payload allocation. Three-run release
